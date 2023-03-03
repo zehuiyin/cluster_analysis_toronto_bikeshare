@@ -1,0 +1,1033 @@
+---
+title: "term_project"
+author: "Zehui Yin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(jsonlite)
+library(arrow)
+library(sf)
+library(sp)
+library(mapview)
+library(sfheaders)
+library(stringr)
+source("geoprocessing_functions.R")
+```
+
+Read and combine trips data
+
+```{r}
+trips1 <- read.csv("./Data/Bike share ridership 2021-01.csv")
+trips2 <- read.csv("./Data/Bike share ridership 2021-02.csv")
+trips3 <- read.csv("./Data/Bike share ridership 2021-03.csv")
+trips4 <- read.csv("./Data/Bike share ridership 2021-04.csv")
+trips5 <- read.csv("./Data/Bike share ridership 2021-05.csv")
+trips6 <- read.csv("./Data/Bike share ridership 2021-06.csv")
+trips7 <- read.csv("./Data/Bike share ridership 2021-07.csv")
+trips8 <- read.csv("./Data/Bike share ridership 2021-08.csv")
+trips9 <- read.csv("./Data/Bike share ridership 2021-09.csv")
+trips10 <- read.csv("./Data/Bike share ridership 2021-10.csv")
+trips11 <- read.csv("./Data/Bike share ridership 2021-11.csv")
+trips12 <- read.csv("./Data/Bike share ridership 2021-12.csv")
+trips <- rbind(trips1, trips2, trips3, trips4, trips5, trips6, trips7, trips8, trips9, trips10, trips11, trips12)
+trips$Start.Time <- as.POSIXct(trips$Start.Time, "%m/%d/%Y %H:%M", tz = "America/Toronto")
+trips$End.Time <- as.POSIXct(trips$End.Time, "%m/%d/%Y %H:%M", tz = "America/Toronto")
+
+write_parquet(trips, "./Data/trips.parquet")
+trips <- read_parquet("./Data/trips.parquet") # only run this line is fine
+```
+
+Read and process station data
+
+```{r}
+stations <- read_json("./Data/station_information.json")
+stations <- stations$data
+stations <- stations$stations
+stations_df <- as.data.frame(matrix(nrow = length(stations), ncol = 14))
+colnames(stations_df) <- c("station_id", "name", "physical_configuration",
+                           "lat", "lon", "altitude", "address", "capacity",
+                           "is_charging_station", "rental_methods", "groups",
+                           "obcn", "nearby_distance", "ride_code_support")
+for (i in 1:length(stations)) {
+  holder <- as.data.frame(unlist(stations[i]))
+  stations_df[i, "station_id"] <- holder["station_id",]
+  stations_df[i, "name"] <- holder["name",]
+  stations_df[i, "physical_configuration"] <- holder["physical_configuration",]
+  stations_df[i, "lat"] <- holder["lat",]
+  stations_df[i, "lon"] <- holder["lon",]
+  stations_df[i, "altitude"] <- holder["altitude",]
+  stations_df[i, "address"] <- holder["address",]
+  stations_df[i, "capacity"] <- holder["capacity",]
+  stations_df[i, "is_charging_station"] <- holder["is_charging_station",]
+  stations_df[i, "rental_methods"] <- paste(holder[str_which(row.names(holder), coll("rental_methods", ignore_case = FALSE, locale = "en")),], collapse = ",")
+  stations_df[i, "groups"] <- holder["groups",]
+  stations_df[i, "obcn"] <- holder["obcn",]
+  stations_df[i, "nearby_distance"] <- holder["nearby_distance",]
+  stations_df[i, "ride_code_support"] <- holder["_ride_code_support",]
+}
+
+write_parquet(stations_df, "./Data/stations.parquet")
+stations_df <- read_parquet("./Data/stations.parquet") # only run this line is fine
+```
+
+Join station locations to trips
+
+```{r}
+trips$Start.lat <- NA
+trips$Start.lon <- NA
+trips$End.lat <- NA
+trips$End.lon <- NA
+
+#for (i in 1:nrow(trips)) { # loop 3575182 times super inefficient
+#  try(trips$Start.lat[i] <- stations_df[which(stations_df$station_id == trips$Start.Station.Id[i]),"lat"])
+#  try(trips$Start.lon[i] <- stations_df[which(stations_df$station_id == trips$Start.Station.Id[i]),"lon"])
+#  try(trips$End.lat[i] <- stations_df[which(stations_df$station_id == trips$End.Station.Id[i]),"lat"])
+#  try(trips$End.lon[i] <- stations_df[which(stations_df$station_id == trips$End.Station.Id[i]),"lon"])
+#}
+
+for (i in unique(trips$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    trips[which(trips$Start.Station.Id == i), "Start.lat"] <- rep(stations_df[which(stations_df$station_id == i),"lat"], nrow(trips[which(trips$Start.Station.Id == i),]))
+    trips[which(trips$Start.Station.Id == i), "Start.lon"] <- rep(stations_df[which(stations_df$station_id == i),"lon"], nrow(trips[which(trips$Start.Station.Id == i),]))
+  }
+}
+
+for (i in unique(trips$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    trips[which(trips$End.Station.Id == i), "End.lat"] <- rep(stations_df[which(stations_df$station_id == i),"lat"], nrow(trips[which(trips$End.Station.Id == i),]))
+    trips[which(trips$End.Station.Id == i), "End.lon"] <- rep(stations_df[which(stations_df$station_id == i),"lon"], nrow(trips[which(trips$End.Station.Id == i),]))
+  }
+}
+
+write_parquet(trips, "./Data/trips.parquet")
+trips <- read_parquet("./Data/trips.parquet") # only run this line is fine
+```
+
+Split by seasons
+
+```{r}
+summary(as.factor(months(trips$Start.Time)))
+trips_spring <- trips[months(trips$Start.Time) %in% c("March", "April", "May"),] # 805719
+trips_summer <- trips[months(trips$Start.Time) %in% c("June", "July", "August"),] # 1413500
+trips_autumn <- trips[months(trips$Start.Time) %in% c("September", "October", "November"),] # 1064864
+trips_winter <- trips[months(trips$Start.Time) %in% c("December", "January", "February"),] # 291099
+```
+
+Aggregate to station level group by start or end and seasons
+
+```{r}
+stations_df$n_start_spring <- NA
+stations_df$n_end_spring <- NA
+stations_df$n_start_summer <- NA
+stations_df$n_end_summer <- NA
+stations_df$n_start_autumn <- NA
+stations_df$n_end_autumn <- NA
+stations_df$n_start_winter <- NA
+stations_df$n_end_winter <- NA
+
+for (i in unique(trips_spring$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_spring"] <- nrow(trips_spring[which(trips_spring$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_spring$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_spring"] <- nrow(trips_spring[which(trips_spring$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_summer$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_summer"] <- nrow(trips_summer[which(trips_summer$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_summer$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_summer"] <- nrow(trips_summer[which(trips_summer$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_autumn$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_autumn"] <- nrow(trips_autumn[which(trips_autumn$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_autumn$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_autumn"] <- nrow(trips_autumn[which(trips_autumn$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_winter$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_winter"] <- nrow(trips_winter[which(trips_winter$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_winter$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_winter"] <- nrow(trips_winter[which(trips_winter$End.Station.Id == i),])
+  }
+}
+
+# code all NAs as 0, these are the current stations that are not operative in the previous year
+stations_df[is.na(stations_df$n_start_spring),"n_start_spring"] <- 0
+stations_df[is.na(stations_df$n_end_spring),"n_end_spring"] <- 0
+stations_df[is.na(stations_df$n_start_summer),"n_start_summer"] <- 0
+stations_df[is.na(stations_df$n_end_summer),"n_end_summer"] <- 0
+stations_df[is.na(stations_df$n_start_autumn),"n_start_autumn"] <- 0
+stations_df[is.na(stations_df$n_end_autumn),"n_end_autumn"] <- 0
+stations_df[is.na(stations_df$n_start_winter),"n_start_winter"] <- 0
+stations_df[is.na(stations_df$n_end_winter),"n_end_winter"] <- 0
+
+# compute percentage of trips in seasons to account for different number of trips
+stations_df$PCT_n_start_spring <- stations_df$n_start_spring/sum(stations_df$n_start_spring)*100
+stations_df$PCT_n_end_spring <- stations_df$n_end_spring/sum(stations_df$n_end_spring)*100
+stations_df$PCT_n_start_summer <- stations_df$n_start_summer/sum(stations_df$n_start_summer)*100
+stations_df$PCT_n_end_summer <- stations_df$n_end_summer/sum(stations_df$n_end_summer)*100
+stations_df$PCT_n_start_autumn <- stations_df$n_start_autumn/sum(stations_df$n_start_autumn)*100
+stations_df$PCT_n_end_autumn <- stations_df$n_end_autumn/sum(stations_df$n_end_autumn)*100
+stations_df$PCT_n_start_winter <- stations_df$n_start_winter/sum(stations_df$n_start_winter)*100
+stations_df$PCT_n_end_winter <- stations_df$n_end_winter/sum(stations_df$n_end_winter)*100
+
+write_parquet(stations_df, "./Data/stations.parquet")
+stations_df <- read_parquet("./Data/stations.parquet") # only run this line is fine
+```
+
+Split trips by membership & season
+
+```{r}
+trips_member <- trips[which(trips$User.Type == "Annual Member"),] # 2140730
+trips_casual <- trips[which(trips$User.Type == "Casual Member"),] # 1434452
+
+# for members
+trips_member_spring <- trips_member[months(trips_member$Start.Time) %in% c("March", "April", "May"),] # 512981
+trips_member_summer <- trips_member[months(trips_member$Start.Time) %in% c("June", "July", "August"),] # 895422
+trips_member_autumn <- trips_member[months(trips_member$Start.Time) %in% c("September", "October", "November"),] # 509649
+trips_member_winter <- trips_member[months(trips_member$Start.Time) %in% c("December", "January", "February"),] # 222678
+
+stations_df$n_start_member_spring <- NA
+stations_df$n_end_member_spring <- NA
+stations_df$n_start_member_summer <- NA
+stations_df$n_end_member_summer <- NA
+stations_df$n_start_member_autumn <- NA
+stations_df$n_end_member_autumn <- NA
+stations_df$n_start_member_winter <- NA
+stations_df$n_end_member_winter <- NA
+
+for (i in unique(trips_member_spring$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_member_spring"] <- nrow(trips_member_spring[which(trips_member_spring$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_spring$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_member_spring"] <- nrow(trips_member_spring[which(trips_member_spring$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_summer$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_member_summer"] <- nrow(trips_member_summer[which(trips_member_summer$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_summer$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_member_summer"] <- nrow(trips_member_summer[which(trips_member_summer$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_autumn$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_member_autumn"] <- nrow(trips_member_autumn[which(trips_member_autumn$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_autumn$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_member_autumn"] <- nrow(trips_member_autumn[which(trips_member_autumn$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_winter$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_member_winter"] <- nrow(trips_member_winter[which(trips_member_winter$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_member_winter$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_member_winter"] <- nrow(trips_member_winter[which(trips_member_winter$End.Station.Id == i),])
+  }
+}
+
+# code all NAs as 0, these are the current stations that are not operative in the previous year
+stations_df[is.na(stations_df$n_start_member_spring),"n_start_member_spring"] <- 0
+stations_df[is.na(stations_df$n_end_member_spring),"n_end_member_spring"] <- 0
+stations_df[is.na(stations_df$n_start_member_summer),"n_start_member_summer"] <- 0
+stations_df[is.na(stations_df$n_end_member_summer),"n_end_member_summer"] <- 0
+stations_df[is.na(stations_df$n_start_member_autumn),"n_start_member_autumn"] <- 0
+stations_df[is.na(stations_df$n_end_member_autumn),"n_end_member_autumn"] <- 0
+stations_df[is.na(stations_df$n_start_member_winter),"n_start_member_winter"] <- 0
+stations_df[is.na(stations_df$n_end_member_winter),"n_end_member_winter"] <- 0
+
+# compute percentage of trips in seasons to account for different number of trips
+stations_df$PCT_n_start_member_spring <- stations_df$n_start_member_spring/sum(stations_df$n_start_member_spring)*100
+stations_df$PCT_n_end_member_spring <- stations_df$n_end_member_spring/sum(stations_df$n_end_member_spring)*100
+stations_df$PCT_n_start_member_summer <- stations_df$n_start_member_summer/sum(stations_df$n_start_member_summer)*100
+stations_df$PCT_n_end_member_summer <- stations_df$n_end_member_summer/sum(stations_df$n_end_member_summer)*100
+stations_df$PCT_n_start_member_autumn <- stations_df$n_start_member_autumn/sum(stations_df$n_start_member_autumn)*100
+stations_df$PCT_n_end_member_autumn <- stations_df$n_end_member_autumn/sum(stations_df$n_end_member_autumn)*100
+stations_df$PCT_n_start_member_winter <- stations_df$n_start_member_winter/sum(stations_df$n_start_member_winter)*100
+stations_df$PCT_n_end_member_winter <- stations_df$n_end_member_winter/sum(stations_df$n_end_member_winter)*100
+
+# for casual users
+trips_casual_spring <- trips_casual[months(trips_casual$Start.Time) %in% c("March", "April", "May"),] # 292738
+trips_casual_summer <- trips_casual[months(trips_casual$Start.Time) %in% c("June", "July", "August"),] # 518078
+trips_casual_autumn <- trips_casual[months(trips_casual$Start.Time) %in% c("September", "October", "November"),] # 555215
+trips_casual_winter <- trips_casual[months(trips_casual$Start.Time) %in% c("December", "January", "February"),] # 68421
+
+stations_df$n_start_casual_spring <- NA
+stations_df$n_end_casual_spring <- NA
+stations_df$n_start_casual_summer <- NA
+stations_df$n_end_casual_summer <- NA
+stations_df$n_start_casual_autumn <- NA
+stations_df$n_end_casual_autumn <- NA
+stations_df$n_start_casual_winter <- NA
+stations_df$n_end_casual_winter <- NA
+
+for (i in unique(trips_casual_spring$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_casual_spring"] <- nrow(trips_casual_spring[which(trips_casual_spring$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_spring$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_casual_spring"] <- nrow(trips_casual_spring[which(trips_casual_spring$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_summer$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_casual_summer"] <- nrow(trips_casual_summer[which(trips_casual_summer$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_summer$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_casual_summer"] <- nrow(trips_casual_summer[which(trips_casual_summer$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_autumn$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_casual_autumn"] <- nrow(trips_casual_autumn[which(trips_casual_autumn$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_autumn$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_casual_autumn"] <- nrow(trips_casual_autumn[which(trips_casual_autumn$End.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_winter$Start.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_start_casual_winter"] <- nrow(trips_casual_winter[which(trips_casual_winter$Start.Station.Id == i),])
+  }
+}
+
+for (i in unique(trips_casual_winter$End.Station.Id)) { # loop under 1000 times
+  if (i %in% unique(stations_df$station_id)) {
+    stations_df[which(stations_df$station_id == i),"n_end_casual_winter"] <- nrow(trips_casual_winter[which(trips_casual_winter$End.Station.Id == i),])
+  }
+}
+
+# code all NAs as 0, these are the current stations that are not operative in the previous year
+stations_df[is.na(stations_df$n_start_casual_spring),"n_start_casual_spring"] <- 0
+stations_df[is.na(stations_df$n_end_casual_spring),"n_end_casual_spring"] <- 0
+stations_df[is.na(stations_df$n_start_casual_summer),"n_start_casual_summer"] <- 0
+stations_df[is.na(stations_df$n_end_casual_summer),"n_end_casual_summer"] <- 0
+stations_df[is.na(stations_df$n_start_casual_autumn),"n_start_casual_autumn"] <- 0
+stations_df[is.na(stations_df$n_end_casual_autumn),"n_end_casual_autumn"] <- 0
+stations_df[is.na(stations_df$n_start_casual_winter),"n_start_casual_winter"] <- 0
+stations_df[is.na(stations_df$n_end_casual_winter),"n_end_casual_winter"] <- 0
+
+# compute percentage of trips in seasons to account for different number of trips
+stations_df$PCT_n_start_casual_spring <- stations_df$n_start_casual_spring/sum(stations_df$n_start_casual_spring)*100
+stations_df$PCT_n_end_casual_spring <- stations_df$n_end_casual_spring/sum(stations_df$n_end_casual_spring)*100
+stations_df$PCT_n_start_casual_summer <- stations_df$n_start_casual_summer/sum(stations_df$n_start_casual_summer)*100
+stations_df$PCT_n_end_casual_summer <- stations_df$n_end_casual_summer/sum(stations_df$n_end_casual_summer)*100
+stations_df$PCT_n_start_casual_autumn <- stations_df$n_start_casual_autumn/sum(stations_df$n_start_casual_autumn)*100
+stations_df$PCT_n_end_casual_autumn <- stations_df$n_end_casual_autumn/sum(stations_df$n_end_casual_autumn)*100
+stations_df$PCT_n_start_casual_winter <- stations_df$n_start_casual_winter/sum(stations_df$n_start_casual_winter)*100
+stations_df$PCT_n_end_casual_winter <- stations_df$n_end_casual_winter/sum(stations_df$n_end_casual_winter)*100
+
+write_parquet(stations_df, "./Data/stations.parquet")
+stations_df <- read_parquet("./Data/stations.parquet") # only run this line is fine
+```
+
+# Earth moving distance
+
+```{r}
+# Earth Mover's Distance
+library(emdist)
+
+# first convert station coordinates to local projection to minimize distortion
+stations_sf <- st_as_sf(stations_df, coords = c("lon", "lat"), crs = 4326, agr = "constant") # WGS84
+# mapview(stations_sf)
+stations_sf <- st_transform(stations_sf, crs = 26917) # reproject to NAD83 Zone 17N
+stations_sf_df <- sf_to_df(stations_sf, fill = T)
+
+# emd for same season start and end
+print("emd for same season start and end")
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_spring","x","y")]), max.iter = 3000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_summer","x","y")]), max.iter = 3000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_autumn","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_autumn","x","y")]), max.iter = 3000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_winter","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_winter","x","y")]), max.iter = 2000)
+print("----------")
+
+# emd for start among different seasons
+print("emd for start among different seasons")
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_summer","x","y")]), max.iter = 3000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_winter","x","y")]), max.iter = 2000)
+
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_winter","x","y")]), max.iter = 2000)
+
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_autumn","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_winter","x","y")]), max.iter = 2000)
+print("----------")
+
+# emd for end among different seasons
+print("emd for end among different seasons")
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_summer","x","y")]), max.iter = 3000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_winter","x","y")]), max.iter = 2000)
+
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_winter","x","y")]), max.iter = 2000)
+
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_autumn","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_winter","x","y")]), max.iter = 2000)
+
+# emd for different type of users for start
+print("emd for different type of users for start")
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_member_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_casual_spring","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_member_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_casual_summer","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_member_autumn","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_casual_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_start_member_winter","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_start_casual_winter","x","y")]), max.iter = 2000)
+print("----------")
+
+# emd for different type of users for end
+print("emd for different type of users for end")
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_member_spring","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_casual_spring","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_member_summer","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_casual_summer","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_member_autumn","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_casual_autumn","x","y")]), max.iter = 2000)
+emd(as.matrix(stations_sf_df[,c("PCT_n_end_member_winter","x","y")]), as.matrix(stations_sf_df[,c("PCT_n_end_casual_winter","x","y")]), max.iter = 2000)
+print("----------")
+```
+## Heatmap table for EMD
+
+```{r}
+library(ztable)
+
+# try correlation table type
+# create output dataframe for table
+emd_result <- as.data.frame(matrix(nrow = 24, ncol = 24))
+rownames(emd_result) <- c("PCT_n_start_spring", 
+               "PCT_n_end_spring", "PCT_n_start_summer", "PCT_n_end_summer", 
+               "PCT_n_start_autumn", "PCT_n_end_autumn", "PCT_n_start_winter",
+               "PCT_n_end_winter", "PCT_n_start_member_spring",
+               "PCT_n_end_member_spring", "PCT_n_start_member_summer",
+               "PCT_n_end_member_summer", "PCT_n_start_member_autumn",
+               "PCT_n_end_member_autumn", "PCT_n_start_member_winter", 
+               "PCT_n_end_member_winter", "PCT_n_start_casual_spring", 
+               "PCT_n_end_casual_spring", "PCT_n_start_casual_summer",
+               "PCT_n_end_casual_summer", "PCT_n_start_casual_autumn", 
+               "PCT_n_end_casual_autumn", "PCT_n_start_casual_winter", 
+               "PCT_n_end_casual_winter")
+colnames(emd_result) <- c("PCT_n_start_spring", 
+               "PCT_n_end_spring", "PCT_n_start_summer", "PCT_n_end_summer", 
+               "PCT_n_start_autumn", "PCT_n_end_autumn", "PCT_n_start_winter",
+               "PCT_n_end_winter", "PCT_n_start_member_spring",
+               "PCT_n_end_member_spring", "PCT_n_start_member_summer",
+               "PCT_n_end_member_summer", "PCT_n_start_member_autumn",
+               "PCT_n_end_member_autumn", "PCT_n_start_member_winter", 
+               "PCT_n_end_member_winter", "PCT_n_start_casual_spring", 
+               "PCT_n_end_casual_spring", "PCT_n_start_casual_summer",
+               "PCT_n_end_casual_summer", "PCT_n_start_casual_autumn", 
+               "PCT_n_end_casual_autumn", "PCT_n_start_casual_winter", 
+               "PCT_n_end_casual_winter")
+
+# record emd results
+emd_result["PCT_n_start_spring", "PCT_n_end_spring"] <- 93.35248
+emd_result["PCT_n_start_summer", "PCT_n_end_summer"] <- 102.9498
+emd_result["PCT_n_start_autumn", "PCT_n_end_autumn"] <- 114.0404
+emd_result["PCT_n_start_winter", "PCT_n_end_winter"] <- 101.9681
+
+emd_result["PCT_n_start_spring", "PCT_n_start_summer"] <- 370.1424
+emd_result["PCT_n_start_spring", "PCT_n_start_autumn"] <- 817.3242
+emd_result["PCT_n_start_spring", "PCT_n_start_winter"] <- 978.1482
+emd_result["PCT_n_start_summer", "PCT_n_start_autumn"] <- 481.1
+emd_result["PCT_n_start_summer", "PCT_n_start_winter"] <- 651.4673
+emd_result["PCT_n_start_autumn", "PCT_n_start_winter"] <- 209.2595
+
+emd_result["PCT_n_end_spring", "PCT_n_end_summer"] <- 377.5933
+emd_result["PCT_n_end_spring", "PCT_n_end_autumn"] <- 832.0513
+emd_result["PCT_n_end_spring", "PCT_n_end_winter"] <- 988.6324
+emd_result["PCT_n_end_summer", "PCT_n_end_autumn"] <- 486.5856
+emd_result["PCT_n_end_summer", "PCT_n_end_winter"] <- 655.3649
+emd_result["PCT_n_end_autumn", "PCT_n_end_winter"] <- 215.855
+
+emd_result["PCT_n_start_member_spring", "PCT_n_start_casual_spring"] <- 1630.353
+emd_result["PCT_n_start_member_summer", "PCT_n_start_casual_summer"] <- 1110.518
+emd_result["PCT_n_start_member_autumn", "PCT_n_start_casual_autumn"] <- 368.7628
+emd_result["PCT_n_start_member_winter", "PCT_n_start_casual_winter"] <- 335.955
+
+emd_result["PCT_n_end_member_spring", "PCT_n_end_casual_spring"] <- 1630.665
+emd_result["PCT_n_end_member_summer", "PCT_n_end_casual_summer"] <- 1106.718
+emd_result["PCT_n_end_member_autumn", "PCT_n_end_casual_autumn"] <- 362.5514
+emd_result["PCT_n_end_member_winter", "PCT_n_end_casual_winter"] <- 333.3849
+
+# try to normal table
+emd_result <- as.data.frame(matrix(nrow = 24, ncol = 3))
+colnames(emd_result) <- c("Distribution 1", "Distribution 2", "EMD")
+library(kableExtra)
+
+# record emd results
+emd_result[1,] <- c("PCT_n_start_spring", "PCT_n_end_spring", 93.35248)
+emd_result[2,] <- c("PCT_n_start_summer", "PCT_n_end_summer", 102.9498)
+emd_result[3,] <- c("PCT_n_start_autumn", "PCT_n_end_autumn", 114.0404)
+emd_result[4,] <- c("PCT_n_start_winter", "PCT_n_end_winter", 101.9681)
+
+emd_result[5,] <- c("PCT_n_start_spring", "PCT_n_start_summer", 370.1424)
+emd_result[6,] <- c("PCT_n_start_spring", "PCT_n_start_autumn", 817.3242)
+emd_result[7,] <- c("PCT_n_start_spring", "PCT_n_start_winter", 978.1482)
+emd_result[8,] <- c("PCT_n_start_summer", "PCT_n_start_autumn", 481.1)
+emd_result[9,] <- c("PCT_n_start_summer", "PCT_n_start_winter", 651.4673)
+emd_result[10,] <- c("PCT_n_start_autumn", "PCT_n_start_winter", 209.2595)
+
+emd_result[11,] <- c("PCT_n_end_spring", "PCT_n_end_summer", 377.5933)
+emd_result[12,] <- c("PCT_n_end_spring", "PCT_n_end_autumn", 832.0513)
+emd_result[13,] <- c("PCT_n_end_spring", "PCT_n_end_winter", 988.6324)
+emd_result[14,] <- c("PCT_n_end_summer", "PCT_n_end_autumn", 486.5856)
+emd_result[15,] <- c("PCT_n_end_summer", "PCT_n_end_winter", 655.3649)
+emd_result[16,] <- c("PCT_n_end_autumn", "PCT_n_end_winter", 215.855)
+
+emd_result[17,] <- c("PCT_n_start_member_spring", "PCT_n_start_casual_spring", 1630.353)
+emd_result[18,] <- c("PCT_n_start_member_summer", "PCT_n_start_casual_summer", 1110.518)
+emd_result[19,] <- c("PCT_n_start_member_autumn", "PCT_n_start_casual_autumn", 368.7628)
+emd_result[20,] <- c("PCT_n_start_member_winter", "PCT_n_start_casual_winter", 335.955)
+
+emd_result[21,] <- c("PCT_n_end_member_spring", "PCT_n_end_casual_spring", 1630.665)
+emd_result[22,] <- c("PCT_n_end_member_summer", "PCT_n_end_casual_summer", 1106.718)
+emd_result[23,] <- c("PCT_n_end_member_autumn", "PCT_n_end_casual_autumn", 362.5514)
+emd_result[24,] <- c("PCT_n_end_member_winter", "PCT_n_end_casual_winter", 333.3849)
+
+kbl(emd_result, booktabs = T, caption = "EMD results") %>%
+  kable_styling() %>%
+  pack_rows("Compare origin and destination distributions in the same seasons", 1, 4) %>%
+  pack_rows("Compare origin distributions in different seasons", 5, 10) %>%
+  pack_rows("Compare destination distributions in different seasons", 11, 16) %>%
+  pack_rows("Compare user type origin distributions in the same seasons", 17, 20) %>%
+  pack_rows("Compare user type destination distributions in the same seasons", 21, 24)
+```
+
+
+Calculate some additional variables for clustering analysis
+
+below are the specification of the entropy:
+
+$$Entropy = -\sum_{k=1}^nP_k*\frac{ln(P_k)}{ln(n)}$$
+Where
+
+$P_k$ = the proportion of total land area of $k^{th}$ land use category found in the buffer being analyzed
+$n$ = total land use categories considered in the study area
+
+```{r}
+# bikeway length within 500 meters
+bikeways <- read_sf("Bike network data.shp")
+# mapview(bikeways)
+stations_df$bikeway_length <- as.data.frame(length_in_buffer(stations_sf, bikeways, 26917, 500))$total_length_within_buffer
+
+# landuse mix within 500 meters
+landuse <- read_sf("ONlur.shp")
+# mapview(landuse)
+summary(as.factor(landuse$CATEGORY)) # Commercial, Government and Institutional, Open Area, Parks and Recreational, Residential, Resource and Industrial, Waterbody
+holder <- calculate_entropy(stations_sf, landuse, 26917, 500, "CATEGORY", exclude_intermediate = F)
+holder <- as.data.frame(holder)
+stations_df$landuse_commercial <- holder$CATEGORY_Commercial
+stations_df$landuse_institutional <- holder$`CATEGORY_Government and Institutional`
+stations_df$landuse_open_area <- holder$`CATEGORY_Open Area`
+stations_df$landuse_recreational <- holder$`CATEGORY_Parks and Recreational`
+stations_df$landuse_residential <- holder$CATEGORY_Residential
+stations_df$landuse_industrial <- holder$`CATEGORY_Resource and Industrial`
+stations_df$landuse_waterbody <- holder$CATEGORY_Waterbody
+stations_df$landuse_entropy <- holder$entropy
+
+# some social demographic variables
+census_data <- read.csv("./Data/census_data_2016.csv")
+census_tract <- read_sf("./Data/census_tract_2016.shp")
+census_tract <- census_tract[which(census_tract$CMANAME == "Toronto"),]
+census_tract <- as.data.frame(census_tract)
+census_tract$CTNAME <- as.numeric(census_tract$CTNAME)
+census_data$COL5 <- as.numeric(census_data$COL5) # COL5 - Census Tract name
+census_data_combined <- inner_join(census_data, census_tract, by = c("COL5" = "CTNAME"))
+census_data_combined <- st_as_sf(census_data_combined) # combine census data with census tract geometry
+# mapview(census_data_combined)
+
+# population density per square kilometre
+stations_df$population_density <- as.data.frame(average_value_in_buffer(stations_sf, census_data_combined, 26917, 500, "COL7", NA_omit = T))[, "COL7"] # Population density per square kilometre
+
+# employment density per square kilometre
+census_data_combined <- as.data.frame(census_data_combined)
+census_data_combined$employment_density <- census_data_combined$COL23 / census_data_combined$COL8 # Employed/Land area in square kilometres
+census_data_combined <- st_as_sf(census_data_combined)
+stations_df$employment_density <- as.data.frame(average_value_in_buffer(stations_sf, census_data_combined[which(!is.na(census_data_combined$employment_density)),], 26917, 500, "employment_density"))[, "employment_density"]
+
+# median income
+stations_df$median_income <- as.data.frame(nearest_median_value(stations_sf, census_data_combined[which(!is.na(census_data_combined$COL14)),], "COL14", 26917))[, "COL14"] # Median total income of households in 2015 ($)
+
+# average age
+stations_df$average_age <- as.data.frame(average_value_in_buffer(stations_sf, census_data_combined[which(!is.na(census_data_combined$COL9)),], 26917, 500, "COL9"))[, "COL9"] # Average age of the population ; Both sexes
+
+# street connectivity (number of intersections within 500 meter buffer)
+int_sec <- read_sf("./Data/CENTRELINE_INTERSECTION_WGS84.shp")
+# mapview(int_sec)
+stations_int_sec <- what_within_each_stops(stations_sf, int_sec, 26917, 500) # generate what intersection falls within buffers
+stations_int_sec$input_rows_within_count <- 0 # create holder to record how many intersections falls within
+for (i in 1:nrow(stations_int_sec)) { # loop over stop rows
+  if(!is.na(str_to_num(i,"input_rows_within",stations_int_sec))[1]){ # check whether there is intersection falls within
+    stations_int_sec$input_rows_within_count[i] <- length(str_to_num(i,"input_rows_within",stations_int_sec)) # record the number of intersections
+  }
+}
+stations_df$street_connectivity <- stations_int_sec$input_rows_within_count
+
+# school presence
+school <- read_sf("./Data/School locations-all types data.shp")
+# mapview(school)
+station_school <- what_within_each_stops(stations_sf, school, 26917, 500)
+station_school$input_rows_within_count <- 0 # create holder to record whether school is in the buffer
+for (i in 1:nrow(station_school)) { # loop over stop rows
+  if(!is.na(str_to_num(i,"input_rows_within",station_school))[1]){ # check whether there is school falls within
+    station_school$input_rows_within_count[i] <- 1
+  }
+}
+stations_df$school_presence <- station_school$input_rows_within_count
+
+# Places of Interest and Toronto Attractions presence
+POI <- read_sf("./Data/Places of Interest and Attractions.shp")
+# mapview(POI)
+station_POI <- what_within_each_stops(stations_sf, POI, 26917, 500)
+station_POI$input_rows_within_count <- 0 # create holder to record whether school is in the buffer
+for (i in 1:nrow(station_POI)) { # loop over stop rows
+  if(!is.na(str_to_num(i,"input_rows_within",station_POI))[1]){ # check whether there is school falls within
+    station_POI$input_rows_within_count[i] <- 1
+  }
+}
+stations_df$POI_presence <- station_POI$input_rows_within_count
+
+write_parquet(stations_df, "./Data/stations.parquet")
+stations_df <- read_parquet("./Data/stations.parquet") # only run this line is fine
+```
+
+Recode variables
+
+```{r}
+var_names <- c("physical_configuration_ELECTRICBIKESTATION",
+               "physical_configuration_REGULAR",
+               "physical_configuration_REGULARLITMAPFRAME",
+               "physical_configuration_SMARTLITMAPFRAME", 
+               "physical_configuration_SMARTMAPFRAME", 
+               "capacity", "is_charging_station_1", 
+               "rental_methods_3", 
+               "rental_methods_4", "PCT_n_start_spring", 
+               "PCT_n_end_spring", "PCT_n_start_summer", "PCT_n_end_summer", 
+               "PCT_n_start_autumn", "PCT_n_end_autumn", "PCT_n_start_winter",
+               "PCT_n_end_winter", "PCT_n_start_member_spring",
+               "PCT_n_end_member_spring", "PCT_n_start_member_summer",
+               "PCT_n_end_member_summer", "PCT_n_start_member_autumn",
+               "PCT_n_end_member_autumn", "PCT_n_start_member_winter", 
+               "PCT_n_end_member_winter", "PCT_n_start_casual_spring", 
+               "PCT_n_end_casual_spring", "PCT_n_start_casual_summer",
+               "PCT_n_end_casual_summer", "PCT_n_start_casual_autumn", 
+               "PCT_n_end_casual_autumn", "PCT_n_start_casual_winter", 
+               "PCT_n_end_casual_winter", "bikeway_length", 
+               "landuse_commercial", "landuse_institutional", 
+               "landuse_open_area", "landuse_recreational", 
+               "landuse_residential", 
+               "landuse_industrial", "landuse_waterbody", 
+               "landuse_entropy", "population_density", "employment_density", 
+               "median_income", "average_age", "street_connectivity", 
+               "school_presence", "POI_presence")
+
+# physical_configuration
+stations_df$physical_configuration_ELECTRICBIKESTATION <- 0
+stations_df[which(stations_df$physical_configuration == "ELECTRICBIKESTATION"), "physical_configuration_ELECTRICBIKESTATION"] <- 1
+
+stations_df$physical_configuration_REGULAR <- 0
+stations_df[which(stations_df$physical_configuration == "REGULAR"), "physical_configuration_REGULAR"] <- 1
+
+stations_df$physical_configuration_REGULARLITMAPFRAME <- 0
+stations_df[which(stations_df$physical_configuration == "REGULARLITMAPFRAME"), "physical_configuration_REGULARLITMAPFRAME"] <- 1
+
+stations_df$physical_configuration_SMARTLITMAPFRAME <- 0
+stations_df[which(stations_df$physical_configuration == "SMARTLITMAPFRAME"), "physical_configuration_SMARTLITMAPFRAME"] <- 1
+
+stations_df$physical_configuration_SMARTMAPFRAME <- 0
+stations_df[which(stations_df$physical_configuration == "SMARTMAPFRAME"), "physical_configuration_SMARTMAPFRAME"] <- 1
+
+# is_charging_station
+stations_df$is_charging_station_1 <- 0
+stations_df[which(stations_df$is_charging_station == "TRUE"), "is_charging_station_1"] <- 1
+
+# rental_methods
+stations_df$rental_methods_4 <- 0 # KEY,TRANSITCARD,CREDITCARD,PHONE
+stations_df[which(stations_df$rental_methods == "KEY,TRANSITCARD,CREDITCARD,PHONE"), "rental_methods_4"] <- 1
+
+stations_df$rental_methods_3 <- 0 # KEY,TRANSITCARD,PHONE
+stations_df[which(stations_df$rental_methods == "KEY,TRANSITCARD,PHONE"), "rental_methods_3"] <- 1
+
+for (i in var_names) {
+  stations_df[, i] <- as.numeric(stations_df[, i])
+}
+
+cor_matrix <- cor(stations_df[, var_names])
+cor_matrix
+```
+
+Cluster analysis
+
+K-means method
+
+```{r}
+library(factoextra)
+
+# distance matrix
+distance <- get_dist(stations_df[, var_names])
+fviz_dist(distance, gradient = list(low = "#00AFBB", mid = "white", high = "#FC4E07"))
+
+# determine number of clusters
+fviz_nbclust(stations_df[, var_names], kmeans, method = "wss", nstart=150) # 4 clusters
+
+# kmeans clustering
+k4 <- kmeans(stations_df[, var_names], centers = 4, nstart = 25)
+p4 <- fviz_cluster(k4, geom = "point", data = stations_df[, var_names]) + ggtitle("k = 4")
+p4
+print(k4)
+
+# check mean value between variables
+tib <- stations_df[, var_names] %>%
+mutate(Cluster = k4$cluster) %>%
+group_by(Cluster) %>%
+summarise_all("mean")
+print.data.frame(tib)
+```
+
+```{r}
+station_cluster <- stations_df[, c("lon", "lat", var_names)] %>% mutate(Cluster = k4$cluster)
+station_cluster$Cluster <- as.factor(station_cluster$Cluster)
+station_cluster <- st_as_sf(station_cluster, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+mapview(station_cluster, zcol = "Cluster")
+```
+
+Hierarchical Clustering
+
+```{r}
+library(cluster)
+
+# check witch linkage method has the highest agglomerative coefficient
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+# function to compute coefficient
+ac <- function(x) {
+agnes(stations_df[, var_names], method = x)$ac
+}
+map_dbl(m, ac)
+
+# Ward clustering results and Dendrogram
+wards <- agnes(stations_df[, var_names], method="ward")
+pltree(wards, cex = 0.6, hang = -1, main = "Dendrogram of agnes")
+
+# scree plot
+fviz_nbclust(stations_df[, var_names], FUN = hcut, method = "wss") # 5 clusters
+
+# Ward's method
+d <- dist(stations_df[, var_names], method = "euclidean")
+hc5 <- hclust(d, method = "ward.D2" )
+# Cut tree into 5 groups
+sub_grp <- cutree(hc5, k = 5)
+# Number of members in each cluster
+table(sub_grp)
+# visualize solution with Dendrogram
+plot(hc5, cex = 0.4)
+rect.hclust(hc5, k = 5, border = 2:5)
+# visualize this solution with first two principal components.
+fviz_cluster(list(data = stations_df[, var_names], cluster = sub_grp))
+
+# check mean value between variables
+tib <- stations_df[, var_names] %>%
+mutate(Cluster = sub_grp) %>%
+group_by(Cluster) %>%
+summarise_all("mean")
+print.data.frame(tib)
+```
+
+```{r}
+station_cluster <- stations_df[, c("lon", "lat", var_names)] %>% mutate(Cluster = sub_grp)
+station_cluster$Cluster <- as.factor(station_cluster$Cluster)
+station_cluster <- st_as_sf(station_cluster, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+mapview(station_cluster, zcol = "Cluster")
+```
+
+DBSCAN
+
+```{r}
+library(dbscan)
+
+# trying to determine the optimal eps to use for k = 15 density
+kNNdistplot(stations_df[, var_names], k = 4)
+abline(h=5000, lty = 2)
+
+# compute the dbscan function
+res.db <- dbscan(stations_df[, var_names], eps=5000, minPts=4)
+fviz_cluster(res.db, stations_df[, var_names], geom = "point")
+
+# descriptive statistics for clusters generated above
+table(res.db$cluster)
+
+tib <- stations_df[, var_names] %>%
+mutate(Cluster = res.db$cluster) %>%
+group_by(Cluster) %>%
+summarise_all("mean")
+print.data.frame(tib)
+```
+
+```{r}
+station_cluster <- stations_df[, c("lon", "lat", var_names)] %>% mutate(Cluster = res.db$cluster)
+station_cluster$Cluster <- as.factor(station_cluster$Cluster)
+station_cluster <- st_as_sf(station_cluster, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+mapview(station_cluster, zcol = "Cluster")
+```
+
+Hierarchical Clustering from Vertex-links (both spatial and attributes taken into account)
+
+```{r}
+library(HCV)
+
+geom_domain <- st_as_sf(stations_df, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+geom_domain <- st_transform(geom_domain, crs = 26917)
+geom_domain <- sf_to_df(geom_domain)
+HCVobj <- HCV(as.matrix(geom_domain[, c("x", "y")]), as.matrix(stations_df[, var_names]))
+
+# visualize dendrograms
+library(ggplot2)
+library(ggdendro)
+ggdendrogram(HCVobj, rotate = FALSE, size = 2, labels = F) + 
+  labs(title = "Dendrogram of Hierarchical Clustering from Vertex-links") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Normally, this value is monotonically increasing. When backward linking occurs, this value will no longer exhibit a strictly increasing behavior
+```
+
+scree plot
+
+```{r}
+calc_SS <- function(df) {
+  sum(as.matrix(dist(df)^2)) / (2 * nrow(df)) # calculate within sum-of-squares for one group
+}
+
+calc_totalSS <- function(df, cluster) { # calculate total within sum-of-squares
+  holder <- df %>% mutate(cluster = cluster)
+  Total_SS <- 0
+  for (i in levels(as.factor(cluster))) {
+    Total_SS <- Total_SS + calc_SS(holder[which(holder$cluster == i),])
+  }
+  return(Total_SS)
+}
+
+scree_total_SS <- matrix(nrow = 24, ncol = 2)
+
+for (i in 1:24) {
+  scree_total_SS[i,] <- c(i, calc_totalSS(stations_df[, var_names], cutree(HCVobj, k = i)))
+}
+
+plot(scree_total_SS, type = "o",
+     xlab = "Number of Clusters", ylab = "Total within sum-of-squares",
+     main = "Scree plot - optimal number of clusters")
+abline(h = 142486792130, col = "blue")
+```
+
+choose k = 7
+
+```{r}
+# cut the tree
+sub_grp <- cutree(HCVobj, k = 7)
+
+HCV_height_adjust <- HCVobj
+HCV_height_adjust$height[is.infinite(HCV_height_adjust$height)] <- max(HCV_height_adjust$height[!is.infinite(HCV_height_adjust$height)]) + 1000000
+HCV_height_adjust$labels <- NA
+plot(as.dendrogram(HCV_height_adjust), 
+     ylim = c(0, max(HCV_height_adjust$height[!is.infinite(HCV_height_adjust$height)])), 
+     main = "Dendrogram of Hierarchical Clustering from Vertex-links with 7 clusters")
+rect.hclust(HCV_height_adjust, k = 7)
+
+# some descriptive statistics
+# check mean value between variables
+tib <- stations_df[, var_names] %>%
+mutate(Cluster = sub_grp) %>%
+group_by(Cluster) %>%
+summarise_all("mean")
+print.data.frame(tib)
+```
+
+visualize in map
+
+```{r}
+station_cluster <- stations_df[, c("lon", "lat", var_names)] %>% mutate(Cluster = sub_grp)
+station_cluster$Cluster <- as.factor(station_cluster$Cluster)
+station_cluster <- st_as_sf(station_cluster, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+mapview(station_cluster, zcol = "Cluster")
+```
+
+Store cluster data with stations into csv for ArcGIS use
+
+```{r}
+station_export <- stations_df %>% mutate(cluster = sub_grp)
+write.csv(station_export, "./Data/Term_project/station_export.csv")
+```
+
+# Use Mahalanobis Distance to deal with high correlation problem
+
+```{r}
+# mahalanobis(stations_df[, var_names], center = colMeans(stations_df[, var_names]), cov = cov(stations_df[, var_names]), tol=1e-50)
+
+library(biotools)
+
+D2.dist <- function (data, cov, inverted = FALSE) 
+{
+    if (!inherits(data, c("data.frame", "matrix"))) 
+        stop("data must be a data.frame or matrix!")
+    stopifnot(is.matrix(cov))
+    if (ncol(data) != ncol(cov)) 
+        stop("incompatible dimensions!")
+    x <- as.matrix(data)
+    n <- nrow(x)
+    D2 <- matrix(0, n, n)
+    dimnames(D2) <- list(rownames(data), rownames(data))
+    if (!inverted) {
+        for (i in 1:n) {
+            for (j in 1:n) {
+                if (i > j) 
+                  D2[i, j] <- crossprod((x[i, ] - x[j, ]), solve(cov, 
+                    (x[i, ] - x[j, ]), tol=1e-300)) # add tolerance here
+            }
+        }
+    }
+    else {
+        for (i in 1:n) {
+            for (j in 1:n) {
+                if (i > j) 
+                  D2[i, j] <- crossprod((x[i, ] - x[j, ]), crossprod(cov, 
+                    (x[i, ] - x[j, ])))
+            }
+        }
+    }
+    return(as.dist(D2))
+}
+
+distD2 <- D2.dist(stations_df[, var_names], cov = cov(stations_df[, var_names]))
+```
+
+```{r}
+library(HCV)
+
+geom_domain <- st_as_sf(stations_df, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+geom_domain <- st_transform(geom_domain, crs = 26917)
+geom_domain <- sf_to_df(geom_domain)
+HCVobj <- HCV(as.matrix(geom_domain[, c("x", "y")]), as.matrix(distD2), diss = "precomputed")
+
+# visualize dendrograms
+library(ggplot2)
+library(ggdendro)
+ggdendrogram(HCVobj, rotate = FALSE, size = 2, labels = F) + 
+  labs(title = "Dendrogram of Hierarchical Clustering from Vertex-links") +
+  theme(plot.title = element_text(hjust = 0.5))
+# Normally, this value is monotonically increasing. When backward linking occurs, this value will no longer exhibit a strictly increasing behavior
+```
+
+scree plot
+
+```{r}
+calc_SS <- function(df) {
+  sum(as.matrix(dist(df)^2)) / (2 * nrow(df)) # calculate within sum-of-squares for one group
+}
+
+calc_totalSS <- function(df, cluster) { # calculate total within sum-of-squares
+  holder <- df %>% mutate(cluster = cluster)
+  Total_SS <- 0
+  for (i in levels(as.factor(cluster))) {
+    Total_SS <- Total_SS + calc_SS(holder[which(holder$cluster == i),])
+  }
+  return(Total_SS)
+}
+
+scree_total_SS <- matrix(nrow = 25, ncol = 2)
+
+for (i in 1:25) {
+  scree_total_SS[i,] <- c(i, calc_totalSS(stations_df[, var_names], cutree(HCVobj, k = i)))
+}
+
+plot(scree_total_SS, type = "o",
+     xlab = "Number of Clusters", ylab = "Total within sum-of-squares",
+     main = "Scree plot - optimal number of clusters")
+abline(h = 541818189789, col = "blue")
+```
+
+choose k = 7
+
+```{r}
+# cut the tree
+sub_grp <- cutree(HCVobj, k = 7)
+
+HCV_height_adjust <- HCVobj
+HCV_height_adjust$height[is.infinite(HCV_height_adjust$height)] <- max(HCV_height_adjust$height[!is.infinite(HCV_height_adjust$height)]) + 500
+HCV_height_adjust$labels <- NA
+plot(as.dendrogram(HCV_height_adjust), 
+     ylim = c(0, max(HCV_height_adjust$height[!is.infinite(HCV_height_adjust$height)])), 
+     main = "Dendrogram of Hierarchical Clustering from Vertex-links with 7 clusters")
+rect.hclust(HCV_height_adjust, k = 7, border = 2:8)
+
+# some descriptive statistics
+# check mean value between variables
+tib <- stations_df[, var_names] %>%
+mutate(Cluster = sub_grp) %>%
+group_by(Cluster) %>%
+summarise_all("mean")
+print.data.frame(tib)
+```
+
+visualize in map
+
+```{r}
+station_cluster <- stations_df[, c("lon", "lat", var_names)] %>% mutate(Cluster = sub_grp)
+station_cluster$Cluster <- as.factor(station_cluster$Cluster)
+station_cluster <- st_as_sf(station_cluster, coords = c("lon", "lat"), crs = 4326, agr = "constant")
+mapview(station_cluster, zcol = "Cluster")
+```
+
+Store cluster data with stations into csv for ArcGIS use
+
+```{r}
+station_export <- stations_df %>% mutate(cluster = sub_grp)
+write.csv(station_export, "./Data/Term_project/station_export_Mahalanobis.csv")
+```
